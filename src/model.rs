@@ -3,7 +3,7 @@ use std::vec;
 
 use crate::config::LlamaConfigJson;
 use crate::kvcache::KVCache;
-use crate::operators as OP;
+use crate::operators::{self as OP, copy_mat, matadd, matmul_transb, rms_norm, silu};
 use crate::params::LLamaParams;
 use crate::tensor::Tensor;
 use safetensors::SafeTensors;
@@ -156,6 +156,13 @@ fn self_attention(
     todo!("Implement self_attention");
 }
 
+/// 计算过程如下：
+/// hidden = rms_norm(residual)
+/// gate = hidden @ gate_weight.T
+/// up = hidden @ up_weight.T
+/// hidden = gate * sigmoid(gate) * up ## silu
+/// hidden = hidden @ down_weight.T
+/// residual = hidden + residual
 fn mlp(
     residual: &mut Tensor<f32>,
     hidden_states: &mut Tensor<f32>,
@@ -167,7 +174,13 @@ fn mlp(
     rms_w: &Tensor<f32>,
     eps: f32,
 ) {
-    todo!("Implement mlp");
+    rms_norm(hidden_states, residual, rms_w, eps);
+    matmul_transb(gate, 0., &hidden_states, w_gate, 1.);
+    matmul_transb(up, 0., &hidden_states, w_up, 1.);
+    silu(up, &gate);
+    matmul_transb(hidden_states, 0., up, w_down, 1.);
+    let residual_ = matadd(&hidden_states, &residual);
+    copy_mat(residual, &residual_);
 }
 
 #[test]
