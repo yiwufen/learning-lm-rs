@@ -40,7 +40,7 @@ impl<T: Copy + Clone + Default> Tensor<T> {
         self.length
     }
 
-    // Reinterpret the tensor as a new shape while preserving total size.
+    /// Reinterpret the tensor as a new shape while preserving total size.
     pub fn reshape(&mut self, new_shape: &Vec<usize>) -> &mut Self {
         let new_length: usize = new_shape.iter().product();
         if new_length != self.length {
@@ -62,10 +62,11 @@ impl<T: Copy + Clone + Default> Tensor<T> {
         }
     }
 
+    
 
 }
 
-// Some helper functions for testing and debugging
+/// Some helper functions for testing and debugging
 impl Tensor<f32> {
     #[allow(unused)]
     pub fn close_to(&self, other: &Self, rel: f32) -> bool {

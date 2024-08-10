@@ -1,6 +1,6 @@
 use crate::tensor::Tensor;
 
-// get (row) vectors from a 2D table given a list of indices
+/// get (row) vectors from a 2D table given a list of indices
 pub fn gather(y: &mut Tensor<f32>, indices: &Tensor<u32>, table: &Tensor<f32>) {
     let length = indices.size();
     let table_shape = table.shape();
@@ -14,7 +14,7 @@ pub fn gather(y: &mut Tensor<f32>, indices: &Tensor<u32>, table: &Tensor<f32>) {
     }
 }
 
-// RoPE: Rotary Positional Embedding
+/// RoPE: Rotary Positional Embedding
 pub fn rope(y: &mut Tensor<f32>, start_pos: usize, theta: f32) {
     let shape = y.shape();
     assert!(shape.len() == 3);
@@ -37,8 +37,9 @@ pub fn rope(y: &mut Tensor<f32>, start_pos: usize, theta: f32) {
     }
 }
 
-// softmax(x) = exp(x - max) / sum(exp(x - max))
-// y = softmax(mask(x))
+/// softmax(x) = exp(x - max) / sum(exp(x - max))
+/// 
+/// y = softmax(mask(x))
 pub fn masked_softmax(y: &mut Tensor<f32>) {
     let ndim = y.shape().len();
     assert!(ndim >= 2);
@@ -71,28 +72,148 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
 }
 
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-    todo!("实现 rms_norm，计算前做一些必要的检查会帮助你后续调试")
+    let (m,n) = (y.shape()[0], y.shape()[1]);
+
+    assert!(m == x.shape()[0] && n == x.shape()[1]);
+    assert!(n == w.size());
+
+    let _y = unsafe { y.data_mut() };
+    let _x = x.data();
+    let _w = w.data();
+
+
+    // Step 3: Normalize and store result
+    for i in 0..m {
+        let mut sum_x_i = 0.0;
+        for j in 0..n {
+            sum_x_i +=  _x[i * n + j] * _x[i * n + j];
+        }
+        let rms = (sum_x_i / n as f32 + epsilon).sqrt();
+        for j in 0..n {
+            _y[i * n + j] = _x[i * n + j] * _w[j] / rms ;
+        }
+    }
 }
 
 // y = sigmoid(x) * x * y
 // hint: this is an element-wise operation
 pub fn silu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
-    // let len = y.size();
-    // assert!(len == x.size());
+    let len = y.size();
+    assert!(len == x.size());
 
-    // let _y = unsafe { y.data_mut() };
-    // let _x = x.data();
-
-    todo!("实现 silu，这里给了一些前期准备工作的提示，你可以参考")
+    let _y = unsafe { y.data_mut() };
+    let _x = x.data();
+    
+    for i in 0..len {
+        let x = _x[i];
+        _y[i] *= x / (1. + (-x).exp());
+    }
+    
 }
 
 // C = beta * C + alpha * A @ B^T
 // hint: You don't need to do an explicit transpose of B
 pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) {
-    todo!("实现 matmul_transb，计算前做一些必要的检查会帮助你后续调试");
+    let c_ = matmul(a, &transpose(b));
+    let c_ = f32_mul_mat(alpha, &c_);
+    let c_ = matadd(&f32_mul_mat(beta, c), &c_);
+    copy_mat(c, &c_);
 }
 
-// Dot product of two tensors (treated as vectors)
+/// Copy the data from a to c
+pub fn copy_mat(c: &mut Tensor<f32>, a: &Tensor<f32>) {
+    let c_shape = c.shape();
+    let a_shape = a.shape();
+    assert!(c_shape == a_shape);
+    let m = c_shape[0];
+    let n = c_shape[1];
+    for i in 0..m {
+        for j in 0..n {
+            unsafe {
+                c.data_mut()[i * n + j] = a.data()[i * n + j];
+            }
+        }
+    }
+}
+
+pub fn f32_mul_mat(beta: f32, a: &Tensor<f32>) -> Tensor<f32> {
+    let a_shape = a.shape();
+    let m = a_shape[0];
+    let n = a_shape[1];
+    let mut c = Tensor::<f32>::new(vec![0.0; m * n], &vec![m, n]);
+    for i in 0..m {
+        for j in 0..n {
+            unsafe {
+                c.data_mut()[i * n + j] = beta * a.data()[i * n + j];
+            }
+        }
+    }
+    c
+}
+
+/// Element-wise addition of two tensors of the same shape
+/// 返回 A + B
+pub fn matadd(a: &Tensor<f32>, b: &Tensor<f32>) -> Tensor<f32> {
+    let a_shape = a.shape();
+    let b_shape = b.shape();
+    assert!(a_shape == b_shape);
+    let m = a_shape[0];
+    let n = a_shape[1];
+    let mut c = Tensor::<f32>::new(vec![0.0; m * n], &vec![m, n]);
+    for i in 0..m {
+        for j in 0..n {
+            unsafe {
+                c.data_mut()[i * n + j] = a.data()[i * n + j] + b.data()[i * n + j];
+            }
+        }
+    }
+    c
+}
+
+/// Matrix multiplication of two tensors
+/// 返回 A * B
+pub fn matmul(x: &Tensor<f32>, y: &Tensor<f32>) -> Tensor<f32> {
+    let x_shape = x.shape();
+    let y_shape = y.shape();
+    assert!(x_shape.len() == 2);
+    assert!(y_shape.len() == 2);
+    assert!(x_shape[1] == y_shape[0]);
+    let m = x_shape[0];
+    let n = x_shape[1];
+    let k = y_shape[1];
+    let mut z = Tensor::<f32>::new(vec![0.0; m * k], &vec![m, k]);
+    for i in 0..m {
+        for j in 0..k {
+            for l in 0..n {
+                unsafe {
+                    z.data_mut()[i * k + j] += x.data()[i * n + l] * y.data()[l * k + j];
+                }
+            }
+        }
+    }
+    z
+}
+
+/// Transpose a 2D tensor  (m, n) -> (n, m) 转置矩阵
+/// 返回 x 的转置
+pub fn transpose(x: &Tensor<f32>) -> Tensor<f32> {
+    let x_shape = x.shape();
+    assert!(x_shape.len() == 2);
+    let m = x_shape[0];
+    let n = x_shape[1];
+    let mut y = Tensor::<f32>::new(vec![0.0; m * n], &vec![n, m]);
+    for i in 0..m {
+        for j in 0..n {
+            unsafe {
+                y.data_mut()[j * m + i] = x.data()[i * n + j];
+            }
+        }
+    }
+    y
+}
+
+/// Dot product of two tensors (treated as vectors)
+/// 返回 x 和 y 的点积
 #[allow(unused)]
 pub fn dot(x: &Tensor<f32>, y: &Tensor<f32>) -> f32 {
     let len = x.size();
@@ -194,6 +315,8 @@ fn test_rms_norm() {
             vec![0.6324554, 2.5298216, 0.8485281, 2.2627416],
             &vec![2, 2]
         ),
+
+        
         1e-3
     ));
 }
@@ -204,6 +327,7 @@ fn test_matmul_transb() {
     let a = Tensor::<f32>::new(vec![1., 2., 3., 4., 5., 6.], &vec![2, 3]);
     let b = Tensor::<f32>::new(vec![1., 2., 3., 4., 5., 6.], &vec![2, 3]);
     matmul_transb(&mut c, 1., &a, &b, 1.);
+    c.print();
     assert!(c.close_to(
         &Tensor::<f32>::new(vec![15., 34., 35., 81.], &vec![2, 2]),
         1e-3
