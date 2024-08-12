@@ -253,35 +253,35 @@ pub fn test_load_safetensors() {
 
 }
 
-#[test]
-fn safetensors_print(){
-    // 打开 .safetensors 文件
-    let mut file = File::open("models/story/model.safetensors").expect("Unable to open file");
+// #[test]
+// fn safetensors_print(){
+//     // 打开 .safetensors 文件
+//     let mut file = File::open("models/story/model.safetensors").expect("Unable to open file");
 
-    // 读取文件内容
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer).expect("Unable to read file");
+//     // 读取文件内容
+//     let mut buffer = Vec::new();
+//     file.read_to_end(&mut buffer).expect("Unable to read file");
 
-    // 解析 SafeTensors
-    let safetensors = SafeTensors::deserialize(&buffer).expect("Unable to deserialize safetensors");
+//     // 解析 SafeTensors
+//     let safetensors = SafeTensors::deserialize(&buffer).expect("Unable to deserialize safetensors");
 
-    let tensor = safetensors.tensor("lm_head.weight").expect("Unable to get tensor");
+//     let tensor = safetensors.tensor("lm_head.weight").expect("Unable to get tensor");
 
-    let tensor = {
-        let p:usize=tensor.shape().iter().product();
-        // 获取引用，只目前只转换成f32类型
-       let new_data=unsafe { slice::from_raw_parts(tensor.data().as_ptr() as *const f32, p)};
-       // 生成新对象
-        Tensor::new(Vec::from(new_data), &tensor.shape().to_vec())
-    };
+//     let tensor = {
+//         let p:usize=tensor.shape().iter().product();
+//         // 获取引用，只目前只转换成f32类型
+//        let new_data=unsafe { slice::from_raw_parts(tensor.data().as_ptr() as *const f32, p)};
+//        // 生成新对象
+//         Tensor::new(Vec::from(new_data), &tensor.shape().to_vec())
+//     };
 
-    println!("50: {}", tensor.data()[50]);
+//     println!("50: {}", tensor.data()[50]);
 
-    // // 打印 SafeTensors 的结构
-    // for (name, tensor) in safetensors.tensors() {
-    //     println!("Tensor name: {}", name);
-    //     println!("Shape: {:?}", tensor.shape());
-    //     println!("Data type: {:?}", tensor.dtype());
-    //     println!("-------------------------");
-    // }
-}
+//     // // 打印 SafeTensors 的结构
+//     // for (name, tensor) in safetensors.tensors() {
+//     //     println!("Tensor name: {}", name);
+//     //     println!("Shape: {:?}", tensor.shape());
+//     //     println!("Data type: {:?}", tensor.dtype());
+//     //     println!("-------------------------");
+//     // }
+// }
