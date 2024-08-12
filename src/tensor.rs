@@ -32,6 +32,8 @@ impl<T: Copy + Clone + Default> Tensor<T> {
         slice::from_raw_parts_mut(ptr, self.length)
     }
 
+    
+
     pub fn shape(&self) -> &Vec<usize> {
         &self.shape
     }
