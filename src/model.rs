@@ -9,7 +9,7 @@ use crate::operators::{self as OP, copy_mat, matadd, matmul_transb, rms_norm, si
 use crate::params::LLamaParams;
 use crate::tensor::Tensor;
 use safetensors::SafeTensors;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 pub struct Llama<T> {
     vocab: usize,           // vocab size
     n_layers: usize,        // number of layers
@@ -122,6 +122,7 @@ impl Llama<f32> {
                 &self.params.rms_out_w, self.eps
             );
             
+            residual.print();
         }
 
         // No matter what seq_len, the output is always a 1D vector of length vocab,
@@ -174,7 +175,7 @@ fn self_attention(
     // Step 1: 计算 QK^T / sqrt(dim)
     let dim = dqkv as f32;
     let sqrt_dim = dim.sqrt();
-
+    // println!("sqrt_dim: {}", sqrt_dim);
     for g in 0..n_groups {
         for h in 0..n_kv_h {
             // 取出Q的当前头
@@ -205,8 +206,40 @@ fn self_attention(
 
             // Step 3: 计算注意力输出 attn @ V
             // x = attn @ V
-            OP::matmul_transb(hidden_states, 0., att_scores, v, 1.0);
-        
+            // Error here
+            // because the shape
+            // hidden_states: (4, 128)   --- (seq, n_kv_h * n_groups * dqkv)
+            // att_scores: (4, 2, 4, 4)  --- (n_kv_h, n_groups, seq, total_seq)
+            // v: (4, 64)                --- (total_seq, n_kv_h * dqkv)
+            // hidden_states = att_scores @ v
+            let att_scores_slice = att_scores.slice(
+                h * n_groups * seq_len * total_seq_len + g * seq_len * total_seq_len,
+                &vec![seq_len, total_seq_len]
+            );
+
+            // 获取 V 的当前切片
+            let v_slice = v.slice(h * dqkv, &vec![total_seq_len, dqkv]);
+            let v_slice_t = OP::transpose(&v_slice);    // 转置 (dqkv, total_seq_len)
+            // 计算输出结果
+            let mut output = Tensor::<f32>::default(&vec![seq_len, dqkv]);
+            OP::matmul_transb(&mut output, 0., &att_scores_slice, &v_slice_t, 1.);
+
+            // 将输出复制回 hidden_states 对应位置
+            for i in 0..seq_len {
+                for d in 0..dqkv {
+                    unsafe {
+                        hidden_states.data_mut()[
+                        g * n_kv_h * dqkv * seq_len + // 组偏移
+                        h * dqkv * seq_len +         // 头偏移
+                        i * dqkv +                   // 序列偏移
+                        d                            // 维度偏移
+                    ] = output.data()[i * dqkv + d];
+                    }
+                    
+                }
+            }
+            
+            
         }
     }
 
@@ -342,4 +375,19 @@ fn safetensors_print(){
         println!("Data type: {:?}", tensor.dtype());
         println!("-------------------------");
     }
+}
+
+
+#[test]
+fn test_forward(){
+    let project = env!("CARGO_MANIFEST_DIR");
+    let model_dir = PathBuf::from(project).join("models").join("story");
+    let llama = Llama::<f32>::from_safetensors(&model_dir);
+    // torch.Size([1, 4])
+    // tensor([[ 1, 80,  0, 10]])
+    let input = Tensor::<u32>::new(vec![1, 80, 0, 10], &vec![1, 4]);
+    let mut cache = llama.new_cache();
+    let output = llama.forward(&input, &mut cache);
+    println!("{:?}", output.data());
+    println!("{:?}", output.shape());
 }

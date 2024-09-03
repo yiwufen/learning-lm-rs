@@ -26,3 +26,4 @@ fn main() {
     );
     println!("{}", tokenizer.decode(&output_ids, true).unwrap());
 }
+
