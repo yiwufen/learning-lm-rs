@@ -103,10 +103,25 @@ impl Llama<f32> {
             let full_k = &mut cache.k_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
             let full_v = &mut cache.v_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
 
-            todo!("self_attention(...)");
-            todo!("down_proj matmul and add residual");
+            // self_attention(&mut hidden_states, &mut att_scores, q, k, v, n_kv_h, n_groups, seq_len, total_seq_len, dqkv);
+            self_attention(&mut hidden_states, &mut att_scores, q, k, v, self.n_kv_h, n_groups, seq_len, total_seq_len, self.dqkv);
+            
+            let mut hidden_states_clone = Tensor::<f32>::default(&vec![seq_len, self.n_kv_h * n_groups * self.dqkv]);
+            OP::copy_mat(&mut hidden_states_clone, &hidden_states);
+            OP::matmul_transb(&mut hidden_states, 0., &hidden_states_clone, &self.params.wo[layer], 1.0);
 
-            todo!("mlp(...)");
+            // 添加残差
+            residual = OP::matadd(&hidden_states, &residual);
+
+
+            // todo!("down_proj matmul and add residual");
+
+            // todo!("mlp(...)");
+            mlp(&mut residual, &mut hidden_states, &mut gate_buf, &mut up_buf, 
+                &self.params.w_up[layer], &self.params.w_down[layer], &self.params.w_gate[layer], 
+                &self.params.rms_out_w, self.eps
+            );
+            
         }
 
         // No matter what seq_len, the output is always a 1D vector of length vocab,
@@ -143,6 +158,7 @@ impl Llama<f32> {
     }
 }
 
+/// 待测试的函数
 fn self_attention(
     hidden_states: &mut Tensor<f32>, // (seq, n_kv_h * n_groups * dqkv)
     att_scores: &mut Tensor<f32>,    // (n_kv_h, n_groups, seq, total_seq)
@@ -155,9 +171,48 @@ fn self_attention(
     total_seq_len: usize,
     dqkv: usize,
 ) {
-    todo!("Implement self_attention");
+    // Step 1: 计算 QK^T / sqrt(dim)
+    let dim = dqkv as f32;
+    let sqrt_dim = dim.sqrt();
+
+    for g in 0..n_groups {
+        for h in 0..n_kv_h {
+            // 取出Q的当前头
+            let q_slice = q.slice(g * n_kv_h + h, &vec![seq_len, dqkv]);
+            // 取出K的当前头
+            let k_slice = k.slice(h, &vec![total_seq_len, dqkv]);
+
+            // 计算 QK^T / sqrt(dim)
+            let mut score = Tensor::<f32>::default(&vec![seq_len, total_seq_len]);
+            OP::matmul_transb(&mut score, 0., &q_slice, &k_slice, 1. / sqrt_dim);
+            
+            // 保存得分
+            for i in 0..seq_len {
+                for j in 0..total_seq_len {
+                    // 将 score 的值复制到 att_scores 对应位置
+                    unsafe {
+                        att_scores.data_mut()[h * n_groups * seq_len * total_seq_len
+                                          + g * seq_len * total_seq_len
+                                          + i * total_seq_len
+                                          + j] = score.data()[i * total_seq_len + j];
+                    }
+                    
+                }
+            }
+            // warning 不确定点
+            // Step 2: 计算 softmax 
+            OP::masked_softmax(att_scores);
+
+            // Step 3: 计算注意力输出 attn @ V
+            // x = attn @ V
+            OP::matmul_transb(hidden_states, 0., att_scores, v, 1.0);
+        
+        }
+    }
+
 }
 
+// let mut score: Tensor<f32> = Tensor::default(&vec![seq_len, total_seq_len]);
 /// 计算过程如下：
 /// hidden = rms_norm(residual)
 /// gate = hidden @ gate_weight.T
@@ -253,35 +308,38 @@ pub fn test_load_safetensors() {
 
 }
 
-// #[test]
-// fn safetensors_print(){
-//     // 打开 .safetensors 文件
-//     let mut file = File::open("models/story/model.safetensors").expect("Unable to open file");
+#[test]
+fn safetensors_print(){
+    // 打开 .safetensors 文件
+    let mut file = File::open("models/story/model.safetensors").expect("Unable to open file");
 
-//     // 读取文件内容
-//     let mut buffer = Vec::new();
-//     file.read_to_end(&mut buffer).expect("Unable to read file");
+    // 读取文件内容
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer).expect("Unable to read file");
 
-//     // 解析 SafeTensors
-//     let safetensors = SafeTensors::deserialize(&buffer).expect("Unable to deserialize safetensors");
+    // 解析 SafeTensors
+    let safetensors = SafeTensors::deserialize(&buffer).expect("Unable to deserialize safetensors");
 
-//     let tensor = safetensors.tensor("lm_head.weight").expect("Unable to get tensor");
 
-//     let tensor = {
-//         let p:usize=tensor.shape().iter().product();
-//         // 获取引用，只目前只转换成f32类型
-//        let new_data=unsafe { slice::from_raw_parts(tensor.data().as_ptr() as *const f32, p)};
-//        // 生成新对象
-//         Tensor::new(Vec::from(new_data), &tensor.shape().to_vec())
-//     };
+    let tensor = safetensors.tensor("lm_head.weight").expect("Unable to get tensor");
 
-//     println!("50: {}", tensor.data()[50]);
+    // let tensor = {
+    //     let p:usize=tensor.shape().iter().product();
+    //     // 获取引用，只目前只转换成f32类型
+    //    let new_data=unsafe { slice::from_raw_parts(tensor.data().as_ptr() as *const f32, p)};
+    //    // 生成新对象
+    //     Tensor::new(Vec::from(new_data), &tensor.shape().to_vec())
+    // };
 
-//     // // 打印 SafeTensors 的结构
-//     // for (name, tensor) in safetensors.tensors() {
-//     //     println!("Tensor name: {}", name);
-//     //     println!("Shape: {:?}", tensor.shape());
-//     //     println!("Data type: {:?}", tensor.dtype());
-//     //     println!("-------------------------");
-//     // }
-// }
+    
+
+    // println!("50: {}", tensor.data()[50]);
+
+    // 打印 SafeTensors 的结构
+    for (name, tensor) in safetensors.tensors() {
+        println!("Tensor name: {}", name);
+        println!("Shape: {:?}", tensor.shape());
+        println!("Data type: {:?}", tensor.dtype());
+        println!("-------------------------");
+    }
+}

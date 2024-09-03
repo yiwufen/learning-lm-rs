@@ -1,3 +1,4 @@
+use core::prelude::rust_2015;
 use std::{slice, sync::Arc, vec};
 pub struct Tensor<T> {
     data: Arc<Box<[T]>>,
@@ -64,7 +65,6 @@ impl<T: Copy + Clone + Default> Tensor<T> {
         }
     }
 
-    
 
 }
 
