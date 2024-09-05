@@ -5,10 +5,12 @@ use std::vec;
 
 use crate::config::LlamaConfigJson;
 use crate::kvcache::KVCache;
-use crate::operators::{self as OP, copy_mat, matadd, matmul_transb, rms_norm, silu};
+use crate::model;
+use crate::operators as OP;
 use crate::params::LLamaParams;
 use crate::tensor::Tensor;
 use safetensors::SafeTensors;
+use tokenizers::Tokenizer;
 use std::path::{Path, PathBuf};
 pub struct Llama<T> {
     vocab: usize,           // vocab size
@@ -70,7 +72,7 @@ impl Llama<f32> {
             Tensor::<f32>::default(&vec![self.n_kv_h, n_groups, seq_len, total_seq_len]);
         let mut gate_buf = Tensor::<f32>::default(&vec![seq_len, self.di]);
         let mut up_buf = Tensor::<f32>::default(&vec![seq_len, self.di]);
-
+        let mut x = Tensor::<f32>::default(&vec![seq_len, self.d]);
         // Computation Starts Here
         // Embedding lookup
         OP::gather(&mut residual, input, &self.params.embedding_table);
@@ -104,32 +106,36 @@ impl Llama<f32> {
             let full_v = &mut cache.v_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
 
             // self_attention(&mut hidden_states, &mut att_scores, q, k, v, n_kv_h, n_groups, seq_len, total_seq_len, dqkv);
-            self_attention(&mut hidden_states, &mut att_scores, q, k, v, self.n_kv_h, n_groups, seq_len, total_seq_len, self.dqkv);
+            self_attention(&mut x, &mut att_scores, q, &full_k, &full_v, 
+                self.n_kv_h, n_groups, seq_len, total_seq_len, self.dqkv);
             
-            let mut hidden_states_clone = Tensor::<f32>::default(&vec![seq_len, self.n_kv_h * n_groups * self.dqkv]);
-            OP::copy_mat(&mut hidden_states_clone, &hidden_states);
-            OP::matmul_transb(&mut hidden_states, 0., &hidden_states_clone, &self.params.wo[layer], 1.0);
+            // x = x @ wo.T
+            OP::matmul_transb(&mut hidden_states, 0., &x, &self.params.wo[layer], 1.);
 
-            // 添加残差
-            residual = OP::matadd(&hidden_states, &residual);
+            // residual = x + residual
+            let len = residual.size();
+            assert!(len == hidden_states.size());
+            let _r = unsafe {
+                residual.data_mut()
+            };
+            let _h = hidden_states.data();
+            for i in 0..len {
+                _r[i] += _h[i];
+            }
 
-
-            // todo!("down_proj matmul and add residual");
-
-            // todo!("mlp(...)");
             mlp(&mut residual, &mut hidden_states, &mut gate_buf, &mut up_buf, 
-                &self.params.w_up[layer], &self.params.w_down[layer], &self.params.w_gate[layer], 
-                &self.params.rms_out_w, self.eps
+                &self.params.w_up[layer], &self.params.w_down[layer], 
+                &self.params.w_gate[layer], 
+                &self.params.rms_ffn_w[layer], self.eps
             );
             
-            residual.print();
         }
 
         // No matter what seq_len, the output is always a 1D vector of length vocab,
         // which contains the probabilities for the next token.
         let mut logits = Tensor::<f32>::default(&vec![1, self.vocab]);
         let mut hidden_states = hidden_states.slice((seq_len - 1) * self.d, &vec![1, self.d]);
-        let residual = residual.slice((seq_len - 1) * self.d, &vec![self.d]);
+        let residual = residual.slice((seq_len - 1) * self.d, &vec![1, self.d]);
 
         OP::rms_norm(
             &mut hidden_states,
@@ -137,7 +143,7 @@ impl Llama<f32> {
             &self.params.rms_out_w,
             self.eps,
         );
-
+        // （1，self.vocab） = （1，self.d） @ （self.vocab，self.d）
         OP::matmul_transb(&mut logits, 0., &hidden_states, &self.params.lm_head, 1.0);
 
         logits
@@ -152,14 +158,27 @@ impl Llama<f32> {
         temperature: f32,
     ) -> Vec<u32>{
         let mut result = Vec::<u32>::new();
-        
-        todo!("实现文本生成");
-        
+        let mut cache = self.new_cache();
+        let mut token: Vec<u32> = Vec::from(token_ids);
+        if token[0] != self.bos_token_id {
+            token.insert(0, self.bos_token_id);
+        }
+        let mut input = Tensor::<u32>::new(token, &vec![1, token_ids.len()]);
+        loop {
+            let output =
+                OP::random_sample(&self.forward(&input, &mut cache), top_p, top_k, temperature);
+            result.push(output);
+            if result.len() >= max_len || output == self.eos_token_id {
+                break;
+            }
+            input = Tensor::<u32>::new(Vec::from([output]), &vec![1, 1]);
+        }
+
         result
     }
 }
 
-/// 待测试的函数
+/// 抄袭jkskj 代码
 fn self_attention(
     hidden_states: &mut Tensor<f32>, // (seq, n_kv_h * n_groups * dqkv)
     att_scores: &mut Tensor<f32>,    // (n_kv_h, n_groups, seq, total_seq)
@@ -172,76 +191,48 @@ fn self_attention(
     total_seq_len: usize,
     dqkv: usize,
 ) {
-    // Step 1: 计算 QK^T / sqrt(dim)
-    let dim = dqkv as f32;
-    let sqrt_dim = dim.sqrt();
-    // println!("sqrt_dim: {}", sqrt_dim);
-    for g in 0..n_groups {
-        for h in 0..n_kv_h {
-            // 取出Q的当前头
-            let q_slice = q.slice(g * n_kv_h + h, &vec![seq_len, dqkv]);
-            // 取出K的当前头
-            let k_slice = k.slice(h, &vec![total_seq_len, dqkv]);
+    let _a = unsafe { att_scores.data_mut() };
+    let _q = q.data();
+    let _k = k.data();
+    let _v = v.data();
+    let sqrt_d = (dqkv as f32).sqrt();
 
-            // 计算 QK^T / sqrt(dim)
-            let mut score = Tensor::<f32>::default(&vec![seq_len, total_seq_len]);
-            OP::matmul_transb(&mut score, 0., &q_slice, &k_slice, 1. / sqrt_dim);
-            
-            // 保存得分
-            for i in 0..seq_len {
-                for j in 0..total_seq_len {
-                    // 将 score 的值复制到 att_scores 对应位置
-                    unsafe {
-                        att_scores.data_mut()[h * n_groups * seq_len * total_seq_len
-                                          + g * seq_len * total_seq_len
-                                          + i * total_seq_len
-                                          + j] = score.data()[i * total_seq_len + j];
-                    }
-                    
-                }
+
+    // Step 1: 计算 QK^T / sqrt(dim)  ==> (seq, n_kv_h * n_groups * dqkv) @ (total_seq, n_kv_h * dqkv) = (n_kv_h, n_groups, seq, total_seq) 
+    for h in 0..n_kv_h * n_groups {
+        for l in 0..seq_len {
+            for i in 0..total_seq_len {
+                let sum = (0..dqkv)
+                    .map(|j| {
+                        _q[l * n_kv_h * n_groups * dqkv + h * dqkv + j]
+                            * _k[i * n_kv_h * dqkv + h / n_groups * dqkv + j]
+                        })
+                        .sum::<f32>();
+                
+                _a[h * seq_len * total_seq_len + l * total_seq_len + i] = sum / sqrt_d;          
             }
-            // warning 不确定点
-            // Step 2: 计算 softmax 
-            OP::masked_softmax(att_scores);
-
-            // Step 3: 计算注意力输出 attn @ V
-            // x = attn @ V
-            // Error here
-            // because the shape
-            // hidden_states: (4, 128)   --- (seq, n_kv_h * n_groups * dqkv)
-            // att_scores: (4, 2, 4, 4)  --- (n_kv_h, n_groups, seq, total_seq)
-            // v: (4, 64)                --- (total_seq, n_kv_h * dqkv)
-            // hidden_states = att_scores @ v
-            let att_scores_slice = att_scores.slice(
-                h * n_groups * seq_len * total_seq_len + g * seq_len * total_seq_len,
-                &vec![seq_len, total_seq_len]
-            );
-
-            // 获取 V 的当前切片
-            let v_slice = v.slice(h * dqkv, &vec![total_seq_len, dqkv]);
-            let v_slice_t = OP::transpose(&v_slice);    // 转置 (dqkv, total_seq_len)
-            // 计算输出结果
-            let mut output = Tensor::<f32>::default(&vec![seq_len, dqkv]);
-            OP::matmul_transb(&mut output, 0., &att_scores_slice, &v_slice_t, 1.);
-
-            // 将输出复制回 hidden_states 对应位置
-            for i in 0..seq_len {
-                for d in 0..dqkv {
-                    unsafe {
-                        hidden_states.data_mut()[
-                        g * n_kv_h * dqkv * seq_len + // 组偏移
-                        h * dqkv * seq_len +         // 头偏移
-                        i * dqkv +                   // 序列偏移
-                        d                            // 维度偏移
-                    ] = output.data()[i * dqkv + d];
-                    }
-                    
-                }
-            }
-            
-            
         }
     }
+
+    // attn = softmax(att_scores)
+    OP::masked_softmax(att_scores);
+
+    // x = attn @ V ==> (seq, n_kv_h * n_groups * dqkv) = (n_kv_h, n_groups, seq, total_seq)  @ (total_seq, n_kv_h * dqkv)
+    let _a = att_scores.data();
+    let _h = unsafe { hidden_states.data_mut() };
+    for h in 0..n_kv_h * n_groups {
+        for l in 0..seq_len {
+            for i in 0..dqkv {
+                let sum = (0..total_seq_len)
+                    .map(|j| {
+                        _a[ h * seq_len * total_seq_len + l * total_seq_len + j]
+                            * _v[i + h / n_groups * dqkv + j * n_kv_h * dqkv]
+                    })
+                    .sum::<f32>();
+                _h[l * n_kv_h * n_groups * dqkv + h * dqkv + i] = sum;
+            }
+        }
+    }          
 
 }
 
@@ -264,13 +255,20 @@ fn mlp(
     rms_w: &Tensor<f32>,
     eps: f32,
 ) {
-    rms_norm(hidden_states, residual, rms_w, eps);
-    matmul_transb(gate, 0., &hidden_states, w_gate, 1.);
-    matmul_transb(up, 0., &hidden_states, w_up, 1.);
-    silu(up, &gate);
-    matmul_transb(hidden_states, 0., up, w_down, 1.);
-    let residual_ = matadd(&hidden_states, &residual);
-    copy_mat(residual, &residual_);
+    OP::rms_norm(hidden_states, residual, rms_w, eps);
+    OP::matmul_transb(gate, 0., &hidden_states, w_gate, 1.);
+    OP::matmul_transb(up, 0., &hidden_states, w_up, 1.);
+    OP::silu(up, &gate);
+    OP::matmul_transb(hidden_states, 0., up, w_down, 1.);
+    let len = residual.size();
+    assert!(len == hidden_states.size());
+    let _r = unsafe {
+        residual.data_mut()
+    };
+    let _h = hidden_states.data();
+    for i in 0..len {
+        _r[i] += _h[i];
+    }
 }
 
 #[test]
@@ -383,11 +381,42 @@ fn test_forward(){
     let project = env!("CARGO_MANIFEST_DIR");
     let model_dir = PathBuf::from(project).join("models").join("story");
     let llama = Llama::<f32>::from_safetensors(&model_dir);
+    let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
     // torch.Size([1, 4])
     // tensor([[ 1, 80,  0, 10]])
     let input = Tensor::<u32>::new(vec![1, 80, 0, 10], &vec![1, 4]);
     let mut cache = llama.new_cache();
     let output = llama.forward(&input, &mut cache);
-    println!("{:?}", output.data());
-    println!("{:?}", output.shape());
+    output.print();
+
+    let next_word = OP::random_sample(&output, 0.1, 10, 1.);
+    // println!("{:?}", output.);
+    // println!("{:?}", output.shape());
+}
+
+#[test]
+fn test_forward_word() {
+    let project_dir = env!("CARGO_MANIFEST_DIR");
+    let model_dir = PathBuf::from(project_dir).join("models").join("story");
+    let llama = model::Llama::<f32>::from_safetensors(&model_dir);
+    let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
+    let input = "Once upon a times";
+    let binding = tokenizer.encode(input, true).unwrap();
+    let mut input_ids = binding.get_ids();
+    // print!("\n{:?}", input_ids);
+    let x = Tensor::<u32>::new(input_ids.to_vec(), &vec![1, input_ids.len()]);
+    let mut cache = llama.new_cache();
+    let output = llama.forward(&x, &mut cache);
+    // output.print();
+    let next_word = OP::random_sample(&output, 0.1, 10, 1.);
+    let output_ids = [&input_ids[..], &[next_word]].concat();
+    println!("{:?}", output_ids);
+    // let output_ids = llama.generate(
+    //     input_ids,
+    //     500,
+    //     0.9,
+    //     4,
+    //     1.,
+    // );
+    println!("{}", tokenizer.decode(&output_ids, true).unwrap());
 }

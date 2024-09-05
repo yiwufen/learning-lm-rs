@@ -72,25 +72,45 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
 }
 
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-    let (m,n) = (y.shape()[0], y.shape()[1]);
-
-    assert!(m == x.shape()[0] && n == x.shape()[1]);
-    assert!(n == w.size());
-
+    assert!(y.size() == x.size());
+    // 获取维度数
+    let ndim = y.shape().len();
+    // 确保至少有2个维度
+    assert!(ndim >= 2);
+    // 序列的数量
+    let seq_len = y.shape()[ndim - 2];
+    // 每个序列的长度
+    let total_seq_len = y.shape()[ndim - 1];
+    // 获取维度数
+    let wdim = w.shape().len();
+    // 确保只有1个维度
+    assert!(wdim == 1);
+    // 确保长度相同
+    assert!(w.size() == total_seq_len);
+    // 批次数量
+    let batch = y.size() / (seq_len * total_seq_len);
+    // 获取数据的引用
     let _y = unsafe { y.data_mut() };
     let _x = x.data();
     let _w = w.data();
-
-
-    // Step 3: Normalize and store result
-    for i in 0..m {
-        let mut sum_x_i = 0.0;
-        for j in 0..n {
-            sum_x_i +=  _x[i * n + j] * _x[i * n + j];
-        }
-        let rms = (sum_x_i / n as f32 + epsilon).sqrt();
-        for j in 0..n {
-            _y[i * n + j] = _x[i * n + j] * _w[j] / rms ;
+    // 遍历每个批次
+    for b in 0..batch {
+        // 当前批次的基索引
+        let base = b * seq_len * total_seq_len;
+        // 遍历批次中的每个序列
+        for l in 0..seq_len {
+            // 当前序列的偏移量
+            let offset = base + l * total_seq_len;
+            // 平方和
+            let s: f32 = _x[offset..offset + total_seq_len]
+                .iter()
+                .map(|f| f * f)
+                .sum();
+            let sqrt = (s / total_seq_len as f32 + epsilon).sqrt();
+            // 计算并储存结果
+            for i in 0..total_seq_len {
+                _y[offset + i] = _w[i] * _x[offset + i] / sqrt;
+            }
         }
     }
 }
@@ -114,103 +134,39 @@ pub fn silu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
 // C = beta * C + alpha * A @ B^T
 // hint: You don't need to do an explicit transpose of B
 pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) {
-    let c_ = matmul(a, &transpose(b));
-    let c_ = f32_mul_mat(alpha, &c_);
-    let c_ = matadd(&f32_mul_mat(beta, c), &c_);
-    copy_mat(c, &c_);
-}
+    assert!(a.shape().len() == b.shape().len());
+    assert!(a.shape().len() == c.shape().len());
 
-/// Copy the data from a to c
-pub fn copy_mat(c: &mut Tensor<f32>, a: &Tensor<f32>) {
-    let c_shape = c.shape();
-    let a_shape = a.shape();
-    assert!(c_shape == a_shape);
-    let m = c_shape[0];
-    let n = c_shape[1];
-    for i in 0..m {
-        for j in 0..n {
-            unsafe {
-                c.data_mut()[i * n + j] = a.data()[i * n + j];
-            }
+    let ndim = a.shape().len();
+    assert!(ndim >= 2);
+    let a_seq_len = a.shape()[ndim - 2];
+    let a_total_seq_len = a.shape()[ndim - 1];
+
+    let b_seq_len = b.shape()[ndim - 2];
+    let b_total_seq_len = b.shape()[ndim - 1];
+
+    let c_seq_len = c.shape()[ndim - 2];
+    let c_total_seq_len = c.shape()[ndim - 1];
+
+    let _c = unsafe { c.data_mut() };
+    let _a = a.data();
+    let _b = b.data();
+
+    assert!(a_total_seq_len == b_total_seq_len);
+    assert!(c_total_seq_len == b_seq_len);
+    assert!(a_seq_len == c_seq_len);
+
+    for l in 0..c_seq_len {
+        for i in 0..c_total_seq_len {
+            let sum = (0..a_total_seq_len)
+                .map(|j| _a[l * a_total_seq_len + j] * _b[i * b_total_seq_len + j])
+                // 指数值的总和
+                .sum::<f32>();
+            _c[l * c_total_seq_len + i] = beta * _c[l * c_total_seq_len + i] + alpha * sum;
         }
     }
 }
 
-pub fn f32_mul_mat(beta: f32, a: &Tensor<f32>) -> Tensor<f32> {
-    let a_shape = a.shape();
-    let m = a_shape[0];
-    let n = a_shape[1];
-    let mut c = Tensor::<f32>::new(vec![0.0; m * n], &vec![m, n]);
-    for i in 0..m {
-        for j in 0..n {
-            unsafe {
-                c.data_mut()[i * n + j] = beta * a.data()[i * n + j];
-            }
-        }
-    }
-    c
-}
-
-/// Element-wise addition of two tensors of the same shape
-/// 返回 A + B
-pub fn matadd(a: &Tensor<f32>, b: &Tensor<f32>) -> Tensor<f32> {
-    let a_shape = a.shape();
-    let b_shape = b.shape();
-    assert!(a_shape == b_shape);
-    let m = a_shape[0];
-    let n = a_shape[1];
-    let mut c = Tensor::<f32>::new(vec![0.0; m * n], &vec![m, n]);
-    for i in 0..m {
-        for j in 0..n {
-            unsafe {
-                c.data_mut()[i * n + j] = a.data()[i * n + j] + b.data()[i * n + j];
-            }
-        }
-    }
-    c
-}
-
-/// Matrix multiplication of two tensors
-/// 返回 A * B
-pub fn matmul(x: &Tensor<f32>, y: &Tensor<f32>) -> Tensor<f32> {
-    let x_shape = x.shape();
-    let y_shape = y.shape();
-    assert!(x_shape.len() == 2);
-    assert!(y_shape.len() == 2);
-    assert!(x_shape[1] == y_shape[0]);
-    let m = x_shape[0];
-    let n = x_shape[1];
-    let k = y_shape[1];
-    let mut z = Tensor::<f32>::new(vec![0.0; m * k], &vec![m, k]);
-    for i in 0..m {
-        for j in 0..k {
-            for l in 0..n {
-                unsafe {
-                    z.data_mut()[i * k + j] += x.data()[i * n + l] * y.data()[l * k + j];
-                }
-            }
-        }
-    }
-    z
-}
-
-/// Transpose a 2D tensor  (m, n) -> (n, m) 转置矩阵
-/// 返回 x 的转置
-pub fn transpose(x: &Tensor<f32>) -> Tensor<f32> {
-    let x_shape = x.shape();
-    assert!(x_shape.len() == 2);
-    let m = x_shape[0];
-    let n = x_shape[1];
-    let mut y = Tensor::<f32>::new(vec![0.0; m * n], &vec![n, m]);
-    for i in 0..m {
-        for j in 0..n {
-            unsafe {
-                y.data_mut()[j * m + i] = x.data()[i * n + j];
-            }
-        }
-    }
-    y
-}
 
 /// Dot product of two tensors (treated as vectors)
 /// 返回 x 和 y 的点积
